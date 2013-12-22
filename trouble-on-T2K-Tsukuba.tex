@@ -1,0 +1,146 @@
+\documentclass[a4j,10pt]{jarticle}
+
+\usepackage{scrextend}
+
+\title{T2K-Tsukuba上で危険なことをしてしまって \\ それに対応した話}
+\author{杉崎 行優\thanks{並木中等教育学校 4年次}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\abstract{
+以前、T2K-Tsukuba上でプロセスを過剰に起動したため、
+それ以上プロセスを\texttt{fork}することが不可能な状態になってしまった。
+
+本報告書では、その状態に至った経緯と解決までの手順を述べる。
+}
+\tableofcontents
+\newpage
+
+\section{プログラムの作成}
+2、3ヶ月程前、僕は MPI を用いて並列に hello world を出力するプログラムを
+美しくしようと考えていた。
+初めは、通信をせずただ単に同時に hello world を出力するものであったが、
+最終的に、リレー方式で ``hello world'' という文字列を回していき、
+最後に受け取った者がそれを出力するというものにした。
+全員が勢いをつけながらも協調する、とても美しいプログラムだ。
+
+\section{プログラムの実行と問題発生}
+そのプログラムを1台のマシン上で16プロセスとして実行したところ、正常に実行終了した。
+そこで僕は、そのプログラムをできるだけ多くのプロセス数で実行したいと考えた。
+そして、1台のマシン上で300プロセスとして実行することにし、下のコマンドを実行した。
+
+\texttt{\$ mpiexec -n 300 ./mpihello} \\
+僕はわくわくしながら hello world が出力されるのを待った。
+
+しばらく経って、僕はプログラムの最後でメモリを開放していないことに気がついた。
+このままでは美しくないと思い、ControlキーとCキーを押してプログラムの中断を試みた。
+しかしなぜかプログラムは終了しない。
+僕は別に開かれていたSSHセッションから下のコマンドを実行した。
+
+\texttt{\$ ps U \$USER} \\
+すると予期しない出力が返ってきた。
+
+\texttt{fork: resource temporary unavilable} \\
+これはつまり、プロセステーブルがいっぱいになってしまい、
+これ以上新しいプロセスを実行することができないということを表している。
+
+\section{原因の究明}
+しかし、通常のシステムではプロセステーブルの大きさは32767程に設定されていて、
+300プロセスを実行した位では全く影響がないはずだ。
+しかし、僕には思い当たりがあり、下のコマンドを実行した。
+
+\texttt{\$ ulimit -a} \\
+このコマンドを実行すると、ユーザのリソース制限の値が表示される。
+出力は以下である。
+\begin{addmargin}[1.5em]{2em}
+\begin{verbatim}
+core file size          (blocks, -c) 0
+data seg size           (kbytes, -d) unlimited
+scheduling priority             (-e) 0
+file size               (blocks, -f) unlimited
+pending signals                 (-i) 257221
+max locked memory       (kbytes, -l) unlimited
+max memory size         (kbytes, -m) 20971520
+open files                      (-n) 1024
+pipe size            (512 bytes, -p) 8
+POSIX message queues     (bytes, -q) 819200
+real-time priority              (-r) 0
+stack size              (kbytes, -s) 10240
+cpu time               (seconds, -t) unlimited
+max user processes              (-u) 200
+virtual memory          (kbytes, -v) unlimited
+file locks                      (-x) unlimited
+\end{verbatim}
+\end{addmargin}
+この中の
+
+\begin{addmargin}[1.5em]{2em}
+\begin{verbatim}
+max user processes              (-u) 200
+\end{verbatim}
+\end{addmargin}
+\noindent
+はユーザが実行できる最大のプロセス数が200であることを示している。
+僕が実行した300のプロセスはこの最大数を余裕で上回っている。
+そして、現在 hello world のプロセスが全ての hello world のプロセスの起動を
+待っており、デッドロックしている状態なのだ。
+
+\section{問題の解決}
+僕は管理者に頼むか自分で解決するか悩んだ。
+最終的に、前者の場合では最悪システム使用停止命令を出されてしまうので、
+自分で解決することを試み、どうしても無理な場合は前者に頼ることにした。
+
+新たなプロセスを起動できないので、プログラムを実行するにはシェル上で\texttt{exec}するか
+シェルの built-in コマンドを実行する必要がある。
+%シェルのbuilt-inコマンドに関しては、以下が存在することが分かった。
+
+SSHセッションは2つ開かれている。
+まず僕は1つのSSHセッションを犠牲に下のコマンドを実行した。
+
+\texttt{\$ exec ps U \$USER} \\
+以下が出力された。
+\begin{addmargin}[1.5em]{2em}
+\begin{verbatim}
+  PID TTY      STAT   TIME COMMAND
+ 7638 pts/2    S      0:00 ./mpihello
+ 7639 pts/2    S      0:00 ./mpihello
+ 7640 pts/2    S      0:00 ./mpihello
+ 7641 pts/2    S      0:00 ./mpihello
+\end{verbatim}
+(以下略)
+\end{addmargin}
+\noindent
+そして、シェル上で以下の関数を定義し、\texttt{/proc} にある
+各プロセスの情報が記されたファイルを走査した。
+
+\begin{addmargin}[1.5em]{2em}\begin{verbatim}
+$ static_cat(){
+    S="notblank"
+    while test "$S"; do
+       read S
+       echo $S
+    done
+ }
+\end{verbatim}\end{addmargin}
+\noindent
+すると、\texttt{/proc/\$PID/cmdline}(ここで\texttt{\$PID}はプロセスIDを表す)に
+プロセス名が記されていることが分かった。
+そこで、以下のスクリプトを実行し、\texttt{./mpihello}と名のついたプロセスを全て終了させた。
+\begin{addmargin}[1.5em]{2em}\begin{verbatim}
+$ for f in /proc/*/cmdline; do
+    read NAME <$f
+    if test "$NAME" == "./mpihello"; then
+       tmp1=${NAME%/*}
+       tmp2=${tmp1#*/}
+       TARGET_PID=${tmp2#*/}
+       echo Killing PID $TARGET_PID
+       kill -KILL $TARGET_PID
+    fi
+ done
+\end{verbatim}\end{addmargin}
+
+これで全 hello world のプロセスが終了したので、問題が解決した。
+
+\end{document}
